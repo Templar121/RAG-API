@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+sentence-transformers
+faiss-cpu
+transformers
+PyPDF2
+docx
