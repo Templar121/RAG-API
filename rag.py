@@ -8,12 +8,12 @@ from functools import lru_cache
 import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
-from huggingface_hub import InferenceApi
 import PyPDF2
 from docx import Document
 from dotenv import load_dotenv
+import requests
 
-load_dotenv()  # loads HUGGINGFACE_HUB_TOKEN
+load_dotenv()  # loads GOOGLE_API_KEY
 
 # Persistence paths
 INDEX_PATH = "index.faiss"
@@ -21,24 +21,15 @@ IDMAP_PATH  = "id_map.pkl"
 
 # Models & Config
 EMBED_MODEL     = "all-MiniLM-L6-v2"
-HF_MODEL        = "EleutherAI/gpt-neo-125M"
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    raise ValueError("Set GOOGLE_API_KEY in your environment or .env")
+
 EMBED_BATCH_SIZE = 32
-TOP_K           = 10
+TOP_K           = 20
 
 # Initialize embedding model
 _embed_model = SentenceTransformer(EMBED_MODEL)
-
-# Initialize HF Inference API client
-HF_TOKEN = os.getenv("HUGGINGFACE_HUB_TOKEN")
-if not HF_TOKEN:
-    raise ValueError("Set HUGGINGFACE_HUB_TOKEN in your environment or .env")
-print(f"[INFO] HF_MODEL = {HF_MODEL}")
-_chat_infer = InferenceApi(
-    repo_id=HF_MODEL,
-    token=HF_TOKEN,
-    task="text-generation"
-)
-
 
 # Load or initialize FAISS index + ID map
 if os.path.exists(INDEX_PATH) and os.path.exists(IDMAP_PATH):
@@ -119,38 +110,53 @@ def query_doc(doc_id: str, question: str) -> str:
         print("[WARN] No context chunks found; returning Not Found")
         return "Not Found"
 
-    # 3️⃣ Build prompt
-    prompt = (
-        "You are a helpful assistant. Based only on the context below, answer the question concisely.\n\n"
-        f"Context:\n{'\n\n'.join(context)}\n\n"
-        f"Question: {question}\n"
-        "Answer:"
-    )
-    print(f"[DEBUG] Full prompt:\n{prompt}")
+    # 3️⃣ Build prompt text
+    prompt_text = (
+    "You are a helpful assistant. Based only on the context below, answer the question concisely.\n\n"
+    f"Context:\n{'\n\n'.join(context)}\n\n"
+    f"Question: {question}\n"
+    "Answer:"
+)
+    print(f"[DEBUG] Full prompt:\n{prompt_text}")
 
-    # 4️⃣ Call HF Inference API
-    raw = _chat_infer(inputs=prompt, raw_response=True)
-    print(f"[DEBUG] Raw response status code: {raw.status_code}")
-    print(f"[DEBUG] Raw response headers: {raw.headers}")
-    
+    # 4️⃣ Call Google Gemini API for text generation
+    # Use the Gemini API endpoint and model
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GOOGLE_API_KEY}"
+    # You can also use other Gemini models like 'gemini-1.0-pro-001', 'gemini-1.5-pro-latest', etc.
+    # Refer to the official documentation for available models and their capabilities.
 
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+    }
 
-    # 5️⃣ Try JSON parsing
-    text = None
-    try:
-        out = raw.json()
-        print(f"[DEBUG] JSON output: {out}")
-        if isinstance(out, list) and "generated_text" in out[0]:
-            text = out[0]["generated_text"]
-    except Exception as e:
-        print(f"[WARN] JSON parsing failed: {e}")
+    payload = {
+        "contents": [{
+            "parts": [{"text": prompt_text}]
+        }],
+        # Add the generationConfig object for Gemini API
+        "generationConfig": {
+            "maxOutputTokens": 200, # Set your desired max output tokens here
+            "temperature": 0.2, # Example temperature
+            # You can add other parameters like topP, topK here if needed
+        }
+    }
 
-    # 6️⃣ Fallback to plain text
-    if text is None:
-        text = raw.text
-        print(f"[DEBUG] Fallback raw.text: {text!r}")
+    response = requests.post(url, headers=headers, json=payload)
+    print(f"[DEBUG] Google API response status: {response.status_code}")
 
-    answer = text.strip()
-    print(f"[INFO] Final answer: {answer!r}")
+    answer = "Sorry, I couldn't generate an answer."
+
+    if response.status_code == 200:
+        data = response.json()
+        # Response typically has: data['candidates'][0]['message']['content']['text']
+        candidates = data.get("candidates")
+        if candidates and len(candidates) > 0:
+            message = candidates[0].get("message", {})
+            content = message.get("content", {})
+            answer = content.get("text", "").strip()
+        print(f"[INFO] Final answer: {answer!r}")
+    else:
+        print(f"[ERROR] Google API error: {response.text}")
+
     return answer
 
