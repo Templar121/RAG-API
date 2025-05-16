@@ -1,23 +1,47 @@
-rag_env/
+# Byte-compiled / cache
 __pycache__/
-artifacts/*
+*.py[cod]
+*.pyo
+*.pyd
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
+# Virtual environment
+venv/
+env/
+rag_env/
+*.env
+
+# Logs and outputs
+*.log
+
+# FAISS index and pickle files
+index.faiss
+id_map.pkl
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# VSCode and IDE settings
+.vscode/
+.idea/
+
+# Python egg metadata
 *.egg-info/
-.installed.cfg
 *.egg
-MANIFEST
+
+# Environment files
+.env
+*.env
+
+# Uploaded files or test inputs
+uploads/
+*.pdf
+*.docx
+*.txt
+*.json
+
+# Hugging Face model cache
+~/.cache/huggingface/

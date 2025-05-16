@@ -2,6 +2,8 @@ fastapi
 uvicorn[standard]
 sentence-transformers
 faiss-cpu
-transformers
 PyPDF2
-docx
+python-docx
+python-multipart
+huggingface-hub
+python-dotenv
