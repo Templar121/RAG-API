@@ -47,9 +47,9 @@ async def query(req: QueryRequest):
     answer = query_doc(req.doc_id, req.question)
     return {"answer": answer}
 
-@app.get("/status", summary="Health check")
+@app.get("/", summary="Health check")
 def health():
-    return {"status": "ok"}
+    return {"status": "Running"}
 
 @app.post("/debug_chunks/", summary="Inspect what chunks are retrieved")
 async def debug_chunks(req: QueryRequest):
