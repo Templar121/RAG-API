@@ -7,3 +7,4 @@ python-docx
 python-multipart
 python-dotenv
 requests
+cachetools

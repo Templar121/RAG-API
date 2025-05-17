@@ -2,161 +2,243 @@ import os
 import io
 import uuid
 import pickle
-from typing import Dict, List
-from functools import lru_cache
+import threading
+import logging
+import re
+from typing import List
 
 import numpy as np
-import faiss
-from sentence_transformers import SentenceTransformer
-import PyPDF2
-from docx import Document
-from dotenv import load_dotenv
 import requests
+import faiss
+from docx import Document
+from cachetools import TTLCache, cached
+from requests.adapters import HTTPAdapter, Retry
+from sentence_transformers import SentenceTransformer
+from PyPDF2 import PdfReader
 
-load_dotenv()  # loads GOOGLE_API_KEY
+# Configure structured logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
 # Persistence paths
-INDEX_PATH = "index.faiss"
-IDMAP_PATH  = "id_map.pkl"
+index_path = "index.faiss"
+idmap_path = "id_map.pkl"
 
 # Models & Config
-EMBED_MODEL     = "all-MiniLM-L6-v2"
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-if not GOOGLE_API_KEY:
-    raise ValueError("Set GOOGLE_API_KEY in your environment or .env")
-
+EMBED_MODEL = "all-MiniLM-L6-v2"
 EMBED_BATCH_SIZE = 32
-TOP_K           = 20
+TOP_K = 20
+CONTEXT_CHUNK_LIMIT = 5   # max chunks per prompt
+QUERY_CACHE = TTLCache(maxsize=128, ttl=3600)  # 1 hr TTL
 
 # Initialize embedding model
-_embed_model = SentenceTransformer(EMBED_MODEL)
+embed_model = SentenceTransformer(EMBED_MODEL)
+dim = embed_model.get_sentence_embedding_dimension()
 
-# Load or initialize FAISS index + ID map
-if os.path.exists(INDEX_PATH) and os.path.exists(IDMAP_PATH):
-    index = faiss.read_index(INDEX_PATH)
-    with open(IDMAP_PATH, "rb") as f:
-        id_map: Dict[int, tuple[str, str]] = pickle.load(f)
+if os.path.exists(index_path) and os.path.exists(idmap_path):
+    # 1) Read back whatever index was saved
+    loaded = faiss.read_index(index_path)
+
+    # 2) If it's already an IndexIDMap2, use it directly
+    if loaded.__class__.__name__ == "IndexIDMap2":
+        index = loaded
+        logger.info("Loaded existing FAISS IndexIDMap2")
+    else:
+        # 3) Otherwise only wrap if it's truly empty
+        if loaded.ntotal != 0:
+            raise RuntimeError(
+                "Expected an IndexIDMap2 on load but got a non-empty base index"
+            )
+        index = faiss.IndexIDMap2(loaded)
+        logger.info("Wrapped loaded empty index in IndexIDMap2")
+
+    # 4) Load the ID→(doc_id, chunk) map
+    with open(idmap_path, "rb") as f:
+        id_map = pickle.load(f)
+    logger.info("Loaded ID map (%d entries)", len(id_map))
+
 else:
-    dim = _embed_model.get_sentence_embedding_dimension()
-    index = faiss.IndexFlatL2(dim)
+    # First run: create a new base index and wrap it
+    base = faiss.IndexFlatL2(dim)
+    index = faiss.IndexIDMap2(base)
     id_map = {}
+    logger.info("Created new FAISS IndexIDMap2")
 
+# Thread lock for FAISS ops
+index_lock = threading.Lock()
 
+# HTTP session with retries for Gemini calls
+def _create_session() -> requests.Session:
+    session = requests.Session()
+    retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[502,503,504])
+    session.mount("https://", HTTPAdapter(max_retries=retries))
+    return session
+
+session = _create_session()
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or ""
+if not GOOGLE_API_KEY:
+    raise ValueError("Set GOOGLE_API_KEY in your environment")
+
+# ─── Extraction: stop at References ─────────────────────────────────────────────
 def extract_text(file_bytes: bytes) -> str:
+    # PDF
     try:
-        reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
-    except:
+        reader = PdfReader(io.BytesIO(file_bytes))
+        pages = []
+        for page in reader.pages:
+            txt = page.extract_text() or ""
+            if re.match(r"^\s*(References|Bibliography)\s*$", txt, re.IGNORECASE | re.MULTILINE):
+                break
+            pages.append(txt)
+        return "\n".join(pages)
+    except Exception:
         pass
+
+    # DOCX
     try:
         doc = Document(io.BytesIO(file_bytes))
-        return "\n".join(p.text for p in doc.paragraphs)
-    except:
+        paras = []
+        for p in doc.paragraphs:
+            if re.match(r"^\s*(References|Bibliography)\s*$", p.text, re.IGNORECASE):
+                break
+            paras.append(p.text)
+        return "\n".join(paras)
+    except Exception:
         pass
-    return file_bytes.decode(errors="ignore")
 
+    return ""
 
-def split_chunks(text: str, size: int = 1000, overlap: int = 200) -> List[str]:
-    chunks, start = [], 0
-    while start < len(text):
-        end = min(start + size, len(text))
-        chunks.append(text[start:end])
-        start += size - overlap
-    return chunks
+# ─── Smart chunk splitter ───────────────────────────────────────────────────────
+def split_chunks(text: str, size: int = 800, overlap: int = 200) -> List[str]:
+    # truncate at first References header
+    m = re.search(r"^\s*(References|Bibliography)\s*$", text, re.IGNORECASE | re.MULTILINE)
+    if m:
+        text = text[:m.start()]
 
+    paras = re.split(r"\n\s*\n", text)
+    chunks = []
+    buffer = ""
 
+    for p in paras:
+        candidate = (buffer + "\n\n" + p).strip() if buffer else p
+        if len(candidate) <= size:
+            buffer = candidate
+        else:
+            if buffer:
+                chunks.append(buffer)
+            if len(p) > size:
+                # window-split
+                for i in range(0, len(p), size - overlap):
+                    chunks.append(p[i:i+size])
+                buffer = ""
+            else:
+                buffer = p
+
+    if buffer:
+        chunks.append(buffer)
+
+    # final ensure no chunk oversized
+    out = []
+    for c in chunks:
+        if len(c) <= size:
+            out.append(c)
+        else:
+            for i in range(0, len(c), size - overlap):
+                out.append(c[i:i+size])
+    return out
+
+# ─── Persistence ────────────────────────────────────────────────────────────────
 def _persist():
-    faiss.write_index(index, INDEX_PATH)
-    with open(IDMAP_PATH, "wb") as f:
-        pickle.dump(id_map, f)
+    with index_lock:
+        faiss.write_index(index, index_path)
+        with open(idmap_path, "wb") as f:
+            pickle.dump(id_map, f)
+    logger.info("Index and ID map saved")
 
-
+# ─── Ingestion ─────────────────────────────────────────────────────────────────
 def ingest_document(file_bytes: bytes) -> str:
-    text    = extract_text(file_bytes)
-    chunks  = split_chunks(text)
-    embs    = _embed_model.encode(chunks, convert_to_numpy=True, batch_size=EMBED_BATCH_SIZE)
+    text = extract_text(file_bytes)
+    chunks = split_chunks(text)
+    if not chunks:
+        logger.warning("No text extracted; nothing to index")
+        return ""
 
-    start = index.ntotal
-    index.add(embs)
+    # embed and cast to float32
+    embs = embed_model.encode(
+        chunks,
+        convert_to_numpy=True,
+        batch_size=EMBED_BATCH_SIZE
+    ).astype("float32")
 
+    # single doc_id for all chunks
     doc_id = str(uuid.uuid4())
-    for i, chunk in enumerate(chunks):
-        id_map[start + i] = (doc_id, chunk)
+
+    for chunk, emb in zip(chunks, embs):
+        # stable positive int64 id
+        vid = np.int64(uuid.uuid4().int & ((1<<63)-1))
+        with index_lock:
+            index.add_with_ids(emb.reshape(1, -1), np.array([vid], dtype="int64"))
+        id_map[vid] = (doc_id, chunk)
 
     _persist()
+    logger.info("Ingested %d chunks for doc %s", len(chunks), doc_id)
     return doc_id
 
-
-@lru_cache(maxsize=128)
+# ─── Query with caching ────────────────────────────────────────────────────────
+@cached(QUERY_CACHE)
 def query_doc(doc_id: str, question: str) -> str:
-    # 1️⃣ Encode question and search
-    print(f"[DEBUG] Encoding question: {question!r}")
-    q_emb = _embed_model.encode([question], convert_to_numpy=True)
-    _, inds = index.search(q_emb, TOP_K)
-    print(f"[DEBUG] FAISS returned indices: {inds[0].tolist()}")
+    q_emb = embed_model.encode([question], convert_to_numpy=True).astype("float32")
 
-    # 2️⃣ Gather and dedupe context chunks
+    with index_lock:
+        D, I = index.search(q_emb, TOP_K)
+
+    # collect up to CONTEXT_CHUNK_LIMIT chunks for this doc
     seen, context = set(), []
-    for idx in inds[0]:
-        if idx in id_map:
-            d_id, chunk = id_map[idx]
-            print(f"[DEBUG] idx {idx} → doc_id {d_id}")
-            if d_id == doc_id and chunk not in seen:
-                context.append(chunk)
-                seen.add(chunk)
-    print(f"[DEBUG] Matched {len(context)} context chunks for doc_id {doc_id}")
+    for vid in I[0]:
+        if vid in id_map:
+            d_id, chunk = id_map[vid]
+            if d_id == doc_id and vid not in seen:
+                context.append(f"— Chunk {vid} —\n{chunk}")
+                seen.add(vid)
+                if len(context) >= CONTEXT_CHUNK_LIMIT:
+                    break
 
     if not context:
-        print("[WARN] No context chunks found; returning Not Found")
         return "Not Found"
 
-    # 3️⃣ Build prompt text
-    prompt_text = (
-    "You are a helpful assistant. Based only on the context below, answer the question concisely.\n\n"
-    f"Context:\n{'\n\n'.join(context)}\n\n"
-    f"Question: {question}\n"
-    "Answer:"
-)
-    print(f"[DEBUG] Full prompt:\n{prompt_text}")
+    prompt = (
+        "You are a helpful assistant. Based only on the context below, answer concisely.\n\n"
+        + "Context (showing {} chunks):\n\n".format(len(context))
+        + "\n\n".join(context)
+        + f"\n\nQuestion: {question}\nAnswer:"
+    )
+    logger.debug("Prompt length: %d chars", len(prompt))
 
-    # 4️⃣ Call Google Gemini API for text generation
-    # Use the Gemini API endpoint and model
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GOOGLE_API_KEY}"
-    # You can also use other Gemini models like 'gemini-1.0-pro-001', 'gemini-1.5-pro-latest', etc.
-    # Refer to the official documentation for available models and their capabilities.
-
-    headers = {
-        "Content-Type": "application/json; charset=utf-8",
-    }
-
+    # call Gemini
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-2.0-flash:generateContent"
+        f"?key={GOOGLE_API_KEY}"
+    )
     payload = {
-        "contents": [{
-            "parts": [{"text": prompt_text}]
-        }],
-        # Add the generationConfig object for Gemini API
-        "generationConfig": {
-            "maxOutputTokens": 200, # Set your desired max output tokens here
-            "temperature": 0.2, # Example temperature
-            # You can add other parameters like topP, topK here if needed
-        }
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": 200, "temperature": 0.2},
     }
 
-    response = requests.post(url, headers=headers, json=payload)
-    print(f"[DEBUG] Google API response status: {response.status_code}")
+    try:
+        res = session.post(url, json=payload, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+        logger.debug("API response JSON: %s", data)
+        candidates = data.get("candidates", [])
+        if candidates:
+            content = candidates[0].get("content", {})
+            parts = content.get("parts", [])
+            if parts and "text" in parts[0]:
+                return parts[0]["text"].strip()
+            else:
+                return "Sorry, no answer generated."
+    except Exception as e:
+        logger.error("Google API error: %s", e)
 
-    answer = "Sorry, I couldn't generate an answer."
-
-    if response.status_code == 200:
-        data = response.json()
-        # Response typically has: data['candidates'][0]['message']['content']['text']
-        candidates = data.get("candidates")
-        if candidates and len(candidates) > 0:
-            message = candidates[0].get("message", {})
-            content = message.get("content", {})
-            answer = content.get("text", "").strip()
-        print(f"[INFO] Final answer: {answer!r}")
-    else:
-        print(f"[ERROR] Google API error: {response.text}")
-
-    return answer
-
+    return "Error generating answer."
