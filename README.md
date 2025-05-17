@@ -9,7 +9,7 @@
 clone the repository
 
 ```bash
-https://github.com/Templar121/End-to-End-Machine-Learning-Pipeline
+https://github.com/Templar121/RAG-API
 ```
 
 ### STEP A - Create a conda environment after opening the repository
