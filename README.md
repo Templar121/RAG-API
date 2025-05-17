@@ -40,3 +40,9 @@ source env/Scripts/activate
 pip install -r requirements.txt
 ```
 
+### STEP 03 - Run the API
+
+```bash
+uvicorn app:app --reload
+```
+
