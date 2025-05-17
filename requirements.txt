@@ -5,5 +5,5 @@ faiss-cpu
 PyPDF2
 python-docx
 python-multipart
-huggingface-hub
 python-dotenv
+requests
