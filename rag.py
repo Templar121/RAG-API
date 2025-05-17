@@ -15,6 +15,9 @@ from cachetools import TTLCache, cached
 from requests.adapters import HTTPAdapter, Retry
 from sentence_transformers import SentenceTransformer
 from PyPDF2 import PdfReader
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Configure structured logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
