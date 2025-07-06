@@ -5,6 +5,7 @@ import threading
 import logging
 import re
 from typing import List
+import certifi
 
 import numpy as np
 import requests
@@ -32,7 +33,12 @@ if not MONGODB_URI:
 MONGODB_DB = os.getenv("MONGODB_DB")
 if not MONGODB_DB:
     raise ValueError("Set MONGODB_DB (database name) in your .env")
-client = MongoClient(MONGODB_URI)
+client = MongoClient(
+    MONGODB_URI,
+    tls=True,
+    tlsCAFile=certifi.where(),
+    serverSelectionTimeoutMS=20000,
+)
 db = client[MONGODB_DB]
 chunks_coll = db["chunks"]
 # Ensure unique index on vid

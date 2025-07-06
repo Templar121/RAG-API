@@ -8,4 +8,5 @@ python-multipart
 python-dotenv
 requests
 cachetools
-pymongo
+pymongo[srv]
+certifi
