@@ -1,12 +1,28 @@
+# Core framework
 fastapi
 uvicorn[standard]
+
+# Embeddings & indexing
 sentence-transformers
 faiss-cpu
+
+# PDF & DOCX parsing
 PyPDF2
 python-docx
+
+# Web form support & config
 python-multipart
 python-dotenv
 requests
+
+# Caching & DB
 cachetools
 pymongo[srv]
 certifi
+
+# === Add this ===
+# Force CPU‑only PyTorch so you don’t get 1+GB of NVIDIA libraries
+torch==2.7.1+cpu
+
+# Tell pip where to find the CPU‑only torch build
+--extra-index-url https://download.pytorch.org/whl/cpu
